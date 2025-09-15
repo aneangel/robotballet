@@ -24,3 +24,5 @@ RobotBalletPg10-13-bib4llm/
 *.pdf
 
 .DS_Store
+
+franka_rl/__init__.py
