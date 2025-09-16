@@ -1,0 +1,21 @@
+# Core dependencies for Robot Ballet Environment
+# MuJoCo and simulation
+mujoco>=3.0.0
+gymnasium>=0.29.0
+
+# Reinforcement Learning
+stable-baselines3[extra]>=2.0.0
+torch>=2.0.0
+tensorboard>=2.10.0
+
+# Graph Neural Networks (for future phases)
+torch-geometric>=2.3.0
+
+# Scientific computing
+numpy>=1.24.0
+scipy>=1.10.0
+matplotlib>=3.6.0
+
+# Utilities
+tqdm>=4.64.0
+wandb>=0.15.0  # Optional: for experiment tracking
