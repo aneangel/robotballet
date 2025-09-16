@@ -138,6 +138,10 @@ class FrankaRLEnvironment(gym.Env):
                   <site name="end_effector" pos="0 0 0.103" size="0.02" rgba="1 0 0 1"/>'''
         )
         
+        # The Panda model from menagerie should already have actuators
+        # Let's not add extra actuators, just use what's there
+        # (The error suggests the model already has 15 actuators including gripper)
+        
         # Add scene elements (modified from kinematic visualizer for sphere target)
         xml_content = xml_content.replace('</worldbody>', f'''
             <!-- Scene lighting -->
@@ -195,14 +199,35 @@ class FrankaRLEnvironment(gym.Env):
             else:
                 print(f"WARNING: Could not find joint {joint_name}")
                 
-        # Find actuator IDs
-        for i in range(7):
-            actuator_name = f"actuator_{i+1}"
-            actuator_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_ACTUATOR, actuator_name)
-            if actuator_id >= 0:
+        # Discover what actuators are actually available
+        print(f"Model has {self.model.nu} total actuators:")
+        all_actuators = []
+        for i in range(self.model.nu):
+            actuator_name = mujoco.mj_id2name(self.model, mujoco.mjtObj.mjOBJ_ACTUATOR, i)
+            all_actuators.append(actuator_name)
+            print(f"  Actuator {i}: {actuator_name}")
+        
+        # Try to find arm actuators by common naming patterns
+        arm_actuator_patterns = [
+            "joint1", "joint2", "joint3", "joint4", "joint5", "joint6", "joint7",
+            "panda_joint1", "panda_joint2", "panda_joint3", "panda_joint4", 
+            "panda_joint5", "panda_joint6", "panda_joint7",
+            "actuator1", "actuator2", "actuator3", "actuator4",
+            "actuator5", "actuator6", "actuator7"
+        ]
+        
+        for pattern in arm_actuator_patterns:
+            actuator_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_ACTUATOR, pattern)
+            if actuator_id >= 0 and actuator_id not in self.robot_actuators:
                 self.robot_actuators.append(actuator_id)
-            else:
-                print(f"WARNING: Could not find actuator {actuator_name}")
+                print(f"Found arm actuator: {pattern} (ID: {actuator_id})")
+                if len(self.robot_actuators) >= 7:
+                    break
+        
+        # If we didn't find 7 arm actuators, just use the first 7 actuators
+        if len(self.robot_actuators) < 7:
+            print(f"Could only find {len(self.robot_actuators)} arm actuators, using first 7 total actuators")
+            self.robot_actuators = list(range(min(7, self.model.nu)))
                 
         # Find end-effector site
         self.ee_site_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_SITE, "end_effector")
@@ -214,7 +239,19 @@ class FrankaRLEnvironment(gym.Env):
         if self.target_body_id < 0:
             print("WARNING: Could not find target_sphere body")
             
-        print(f"Found {len(self.robot_joints)} joints and {len(self.robot_actuators)} actuators")
+        print(f"Using {len(self.robot_joints)} joints and {len(self.robot_actuators)} actuators for arm control")
+        
+        # CRITICAL GUARDRAIL: Ensure we have actuators
+        if self.model.nu == 0:
+            raise RuntimeError(
+                "This MuJoCo model has 0 actuators. The robot cannot be controlled!"
+            )
+        
+        if len(self.robot_actuators) == 0:
+            raise RuntimeError(
+                f"Could not find any suitable actuators for arm control. "
+                f"Available actuators in model: {all_actuators}"
+            )
         
     def _setup_spaces(self):
         """Define observation and action spaces."""
@@ -314,22 +351,56 @@ class FrankaRLEnvironment(gym.Env):
         return obs, reward, terminated, truncated, info
         
     def _apply_action(self, action: np.ndarray):
-        """Apply joint position increments."""
+        """
+        Apply joint position increments for position actuators.
+        
+        For position actuators, data.ctrl should contain target joint positions,
+        not increments. We compute target positions and send them to actuators.
+        """
         action = np.clip(action, self.action_space.low, self.action_space.high)
         
-        for i, actuator_id in enumerate(self.robot_actuators):
-            if i < len(action):
-                joint_id = self.robot_joints[i]
-                current_pos = self.data.qpos[joint_id]
-                target_pos = current_pos + action[i]
-                
-                # Apply joint limits
-                joint_range = self.model.jnt_range[joint_id]
-                if joint_range[0] < joint_range[1]:
-                    target_pos = np.clip(target_pos, joint_range[0], joint_range[1])
-                
-                # Set control target
-                self.data.ctrl[actuator_id] = target_pos
+        # Get current joint positions for the arm joints
+        current_qpos = np.array([self.data.qpos[joint_id] for joint_id in self.robot_joints])
+        
+        # Calculate target positions (current + increments)
+        target_qpos = current_qpos + action
+        
+        # Apply joint limits from the model
+        for i, joint_id in enumerate(self.robot_joints):
+            joint_range = self.model.jnt_range[joint_id]
+            if joint_range[0] < joint_range[1]:  # Valid range exists
+                target_qpos[i] = np.clip(target_qpos[i], joint_range[0], joint_range[1])
+        
+        # Initialize all controls to current positions to avoid sudden movements
+        # This handles the case where there are more actuators than arm joints (e.g., gripper)
+        for i in range(self.model.nu):
+            if i < len(self.robot_actuators) and i < len(target_qpos):
+                # Use our computed target position for arm actuators
+                actuator_id = self.robot_actuators[i]
+                self.data.ctrl[actuator_id] = target_qpos[i]
+            else:
+                # For other actuators (e.g., gripper), maintain current position
+                # Find the joint associated with this actuator
+                try:
+                    # Get actuator joint ID and use current position
+                    actuator_name = mujoco.mj_id2name(self.model, mujoco.mjtObj.mjOBJ_ACTUATOR, i)
+                    if actuator_name and 'finger' in actuator_name.lower():
+                        # Keep gripper closed
+                        self.data.ctrl[i] = 0.0
+                    else:
+                        # For other actuators, try to maintain current state
+                        self.data.ctrl[i] = 0.0  # Neutral position
+                except:
+                    self.data.ctrl[i] = 0.0
+            
+        # Debug: Print first few actions to verify control is working
+        if not hasattr(self, '_debug_action_count'):
+            self._debug_action_count = 0
+        self._debug_action_count += 1
+        
+        if self._debug_action_count <= 3:
+            print(f"Action {self._debug_action_count}: input={action[:3]}, target_pos={target_qpos[:3]}")
+            print(f"  Total ctrl size: {self.data.ctrl.shape}, arm actuators: {len(self.robot_actuators)}")
                 
     def _get_observation(self) -> np.ndarray:
         """Get current observation."""
@@ -367,38 +438,35 @@ class FrankaRLEnvironment(gym.Env):
         """
         Calculate reward for reaching the target sphere.
         
-        Reward structure:
-        - Dense distance-based reward for guidance
+        Clean reward structure focused on reaching the target:
+        - Primary: Distance to target (negative, so closer = higher reward)
         - Success bonus for reaching target
-        - Efficiency bonus for smooth motion
-        - Penalty for excessive motion
+        - Small penalties for excessive motion
         """
         ee_pos = self.data.site_xpos[self.ee_site_id]
         current_distance = np.linalg.norm(ee_pos - self.current_target)
         
-        reward = 0.0
+        # Primary reward: negative distance (closer = better)
+        reward = -current_distance
         
-        # 1. Distance-based reward (dense guidance)
-        if self.prev_distance is not None:
-            progress = self.prev_distance - current_distance
-            reward += progress * 10.0  # Scale progress reward
-            
-        # 2. Success bonus
+        # Large success bonus
         if current_distance <= self.goal_tolerance:
-            reward += 100.0  # Large success bonus
+            reward += 10.0  # Success bonus
             
-        # 3. Proximity bonus (gets stronger as we get closer)
-        proximity_bonus = np.exp(-current_distance * 5.0)
-        reward += proximity_bonus
-        
-        # 4. Efficiency penalty (penalize large actions)
-        action_penalty = np.sum(np.abs(action)) * 0.1
+        # Small action penalty to encourage efficiency
+        action_penalty = np.sum(np.abs(action)) * 0.01
         reward -= action_penalty
         
-        # 5. Velocity penalty (encourage smooth motion)
-        joint_vels = np.array([self.data.qvel[joint_id] for joint_id in self.robot_joints])
-        velocity_penalty = np.sum(np.abs(joint_vels)) * 0.05
-        reward -= velocity_penalty
+        # Track progress for debugging
+        if self.prev_distance is not None:
+            progress = self.prev_distance - current_distance
+            # Don't add progress to reward, just track it
+            if not hasattr(self, '_debug_reward_count'):
+                self._debug_reward_count = 0
+            self._debug_reward_count += 1
+            
+            if self._debug_reward_count <= 5:
+                print(f"Reward {self._debug_reward_count}: dist={current_distance:.4f}, progress={progress:.4f}, reward={reward:.3f}")
         
         # Update previous distance
         self.prev_distance = current_distance
